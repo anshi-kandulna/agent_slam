@@ -295,7 +295,7 @@ def run(sandbox: bool = False):
         on_close=on_close
     )
 
-    ws.run_forever()
+    ws.run_forever(ping_interval=30, ping_timeout=10)
 
 
 if __name__ == "__main__":

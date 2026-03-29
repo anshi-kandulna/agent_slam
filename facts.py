@@ -1311,7 +1311,13 @@ FACTS: list[dict] = [
 
 # ── Domain Detection ───────────────────────────────────────────────────────────
 
-DOMAIN_KEYWORDS = {
+AVAILABLE_DOMAINS = ["finance", "marketing", "ethics", "general"]
+
+# Cache: topic string -> list of matched domains (Groq called once per match)
+_domain_cache: dict[str, list[str]] = {}
+
+# Keyword fallback (used if Groq fails)
+_DOMAIN_KEYWORDS = {
     "finance": [
         "finance", "financial", "economy", "economic", "gdp",
         "investment", "market", "banking", "debt", "inflation",
@@ -1333,32 +1339,71 @@ DOMAIN_KEYWORDS = {
 }
 
 
-def detect_domain(topic: str) -> str:
+def detect_domains_groq(topic: str) -> list[str]:
+    """
+    Uses Groq to identify ALL relevant domains for a debate topic.
+    Returns e.g. ["finance", "ethics"] for cross-domain topics.
+    Cached — Groq called once per unique topic, zero per-turn cost after that.
+    Falls back to keyword scoring if Groq fails.
+    """
+    if topic in _domain_cache:
+        print(f"[facts] domain cache hit: {_domain_cache[topic]}")
+        return _domain_cache[topic]
+
+    try:
+        import os
+        from groq import Groq as _Groq
+        _groq = _Groq(api_key=os.getenv("GROQ_API_KEY2", ""))
+
+        prompt = (
+            f"Available domains: {AVAILABLE_DOMAINS}\n"
+            f"Debate topic: \"{topic}\"\n\n"
+            "Choose ALL domains relevant to this topic. "
+            "Reply with ONLY a comma-separated list, e.g.: finance,ethics\n"
+            "Reply:"
+        )
+
+        resp    = _groq.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "You classify debate topics into domains. Reply with comma-separated domain names only. No explanation."},
+                {"role": "user",   "content": prompt}
+            ],
+            max_completion_tokens=20,
+            temperature=0.0
+        )
+        raw     = resp.choices[0].message.content.strip().lower()
+        domains = [d.strip() for d in raw.split(",") if d.strip() in AVAILABLE_DOMAINS]
+        if not domains:
+            domains = ["general"]
+        _domain_cache[topic] = domains
+        print(f"[facts] Groq domain detection: {domains}")
+        return domains
+
+    except Exception as e:
+        print(f"[facts] Groq domain detection failed ({str(e)[:80]}) — keyword fallback")
+
+    # Keyword fallback
     topic_lower = topic.lower()
-    scores = {d: 0 for d in DOMAIN_KEYWORDS}
-
-    for domain, keywords in DOMAIN_KEYWORDS.items():
-        scores[domain] = sum(1 for kw in keywords if kw in topic_lower)
-
-    best = max(scores, key=scores.get)
-
-    if scores[best] == 0:
-        return "general"
-
-    # Handle ties — return first tied domain (finance > marketing > ethics)
-    return best
+    scores  = {d: sum(1 for kw in kws if kw in topic_lower) for d, kws in _DOMAIN_KEYWORDS.items()}
+    matched = [d for d, s in scores.items() if s > 0]
+    result  = matched if matched else ["general"]
+    _domain_cache[topic] = result
+    print(f"[facts] keyword fallback domains: {result}")
+    return result
 
 
 def get_facts_by_stance(topic: str, stance: str, max_facts: int = 4) -> list[dict]:
     """
-    Returns top N facts filtered by domain + stance,
-    sorted by strength descending.
+    Returns top N facts filtered by ALL relevant domains + stance.
+    Multi-domain aware — cross-domain topics get facts from all matching domains.
+    Sorted by strength descending.
     """
-    domain     = detect_domain(topic)
-    stance_up  = stance.upper()
+    domains   = detect_domains_groq(topic)
+    stance_up = stance.upper()
 
-    # Pull from matched domain + general as fallback
-    pool = [f for f in FACTS if f["domain"] == domain]
+    # Pull from ALL matched domains
+    pool = [f for f in FACTS if f["domain"] in domains]
     if not pool:
         pool = [f for f in FACTS if f["domain"] == "general"]
 
@@ -1368,7 +1413,7 @@ def get_facts_by_stance(topic: str, stance: str, max_facts: int = 4) -> list[dic
     # Sort by strength
     filtered.sort(key=lambda x: x.get("strength", 0.5), reverse=True)
 
-    print(f"[facts] domain={domain} | stance={stance_up} | matched={len(filtered)}")
+    print(f"[facts] domains={domains} | stance={stance_up} | pool={len(pool)} | matched={len(filtered)}")
     return filtered[:max_facts]
 
 

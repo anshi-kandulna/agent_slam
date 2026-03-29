@@ -38,7 +38,7 @@ ABSOLUTE RULES:
 - If opponent makes a strong point — reframe it to support YOUR side instead
 - No markdown, no bullet points, no headers — flowing prose only
 - Output ONLY the argument text, nothing else
-- Stay under 2000 characters
+- Stay under 2500 characters
 - Sound like a confident human debater, not a robot"""
 
 
