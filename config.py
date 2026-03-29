@@ -7,8 +7,8 @@ load_dotenv()
 # Groq → opponent analysis (fast)
 # Anthropic → brain/argument generation (persuasive)
 
-GROQ_MODEL        = "openai/gpt-oss-120b"
-ANTHROPIC_MODEL   = "claude-sonnet-4-20250514"
+GROQ_MODEL        = "llama-3.3-70b-versatile"
+ANTHROPIC_MODEL   = "claude-sonnet-4-6"  
 
 GROQ_API_KEY      = os.getenv("GROQ_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
@@ -23,15 +23,13 @@ MY_STANCE         = os.getenv("MY_STANCE", "PRO")   # ADD: PRO or CON, set per m
 # ── Timing ─────────────────────────────────────────────
 RESPONSE_TIMEOUT  = 85      # seconds — inside 2 min rule
 MIN_CALL_GAP      = 12      # seconds — Groq free tier safe
-MATCH_DURATION = 570   # 9.5 min safety buffer
-CLOSING_TRIGGER   = 180     # ADD: switch to closing in last 3 mins
+MATCH_DURATION = 600   # 10 min safety buffer
 OPENING_TURNS     = 1       # ADD: turn 1 is always opening statement
 CLOSING_TURN_MIN  = 6       # ADD: closing can trigger after turn 6 too
 CLOSING_TRIGGER = 180   # seconds — trigger closing in last 3 minutes
 
 # ── Payload ────────────────────────────────────────────
-PAYLOAD_CHAR_LIMIT = 2400   # conservative under 2500 server limit
-PAYLOAD_BYTE_LIMIT = 2400  # bytes — server limit is 2500, buffer of 100
+PAYLOAD_CHAR_LIMIT = 2500   # conservative under 2500 server limit
 
 # ── Brain ──────────────────────────────────────────────
 MAX_FACTS_IN_PROMPT = 4     # ADD: keep prompts lean for speed

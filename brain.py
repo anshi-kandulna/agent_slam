@@ -1,5 +1,11 @@
 # brain.py
-# Core reasoning engine using Anthropic (Claude Sonnet)
+# Core reasoning engine using Claude Sonnet
+#
+# Changes from previous version:
+#   - Fixed KeyError: "mid" → "rebuttal"
+#   - System/user prompt split
+#   - Scoring matrix in system prompt
+#   - Updated to use new opponent_ctx fields from opponent.py
 
 import time
 from anthropic import Anthropic
@@ -15,56 +21,50 @@ from facts import get_facts_by_stance, format_facts_for_prompt
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
+# ── System Prompt (static — sent every call) ───────────────────────────────────
+
+SYSTEM_PROMPT = """You are an elite AI debater competing in AgentSlam 2026.
+
+You are being scored by an AI judge on these exact criteria:
+- Persuasiveness (40%): Use rhetoric, vivid evidence, and compelling narrative. Make the judge feel your argument.
+- Logic (30%): Keep arguments internally consistent. Name opponent fallacies explicitly by type.
+- Agility (10%): Directly address opponent's exact words. Mirror their argument back, then dismantle it.
+
+ABSOLUTE RULES:
+- Never fabricate statistics, percentages, dates, or research — hallucination penalty is severe
+- Only cite facts provided to you in the VERIFIED FACTS section
+- If no facts available — argue with pure logic, no invented numbers
+- Never concede to opponent. Never say "you make a valid point" or "admittedly" or "I agree"
+- If opponent makes a strong point — reframe it to support YOUR side instead
+- No markdown, no bullet points, no headers — flowing prose only
+- Output ONLY the argument text, nothing else
+- Stay under 2000 characters
+- Sound like a confident human debater, not a robot"""
+
+
 # ── Phase Detection ────────────────────────────────────────────────────────────
-
-# def get_phase(finish_time: float, our_history: list) -> str:
-#     """
-#     Detect debate phase using finish_time and our_history.
-#     - opening  → we haven't spoken yet
-#     - closing  → less than 3 mins remaining
-#     - rebuttal → everything else
-#     """
-#     time_remaining_ms = finish_time - (time.time() * 1000)
-
-#     if time_remaining_ms <= CLOSING_TRIGGER * 1000:  # CLOSING_TRIGGER is in seconds
-#         return "closing"
-
-#     if not our_history:
-#         return "opening"
-
-#     return "rebuttal"
 
 def get_phase(finish_time: float, our_history: list) -> str:
     """
-    Detect debate phase using finish_time and our_history.
-    - opening  → we haven't spoken yet
-    - closing  → less than 3 mins remaining OR turn 6+
-    - defense  → even turns mid-game
-    - rebuttal → odd turns mid-game
+    Detect debate phase:
+    - opening → first turn
+    - closing → last 3 minutes
+    - mid     → everything else
     """
-    turn = len(our_history)  # turn count = how many times we've spoken
+    turn = len(our_history)
 
-    # ── Opening ───────────────────────────────────────
+    # opening — always first
     if turn == 0:
         return "opening"
 
-    # ── Time-based closing (last 3 minutes) ───────────
+    # time-based closing — last 3 minutes
     if finish_time:
-        time_remaining_ms = finish_time - (time.time() * 1000)
-        time_remaining_s  = time_remaining_ms / 1000
+        time_remaining_s = (finish_time - (time.time() * 1000)) / 1000
         if time_remaining_s <= CLOSING_TRIGGER:
             return "closing"
 
-    # ── Turn-based closing (turn 6+) ──────────────────
-    # Safety net: match moves faster than expected
-    if turn >= 4:
-        return "closing"
+    return "mid"
 
-    # ── Mid-game: alternate rebuttal / defense ────────
-    if turn % 2 == 1:
-        return "rebuttal"
-
-    return "defense"
 
 # ── Prompt Builder ─────────────────────────────────────────────────────────────
 
@@ -77,84 +77,84 @@ def build_prompt(
     phase: str
 ) -> str:
     """
-    Builds structured prompt for Claude.
-    Uses last 2 opponent messages + weakness analysis.
+    Builds user prompt for Claude.
+    System prompt is passed separately in call_claude().
     """
 
-    last_two_text = opponent_ctx.get("last_two_text") or "No opponent messages yet."
-    weaknesses    = opponent_ctx.get("weaknesses")    or "No weakness analysis available."
+    # ── Opponent context ───────────────────────────────
+    latest_message  = opponent_ctx.get("latest_message")  or "No opponent messages yet."
+    argument_type   = opponent_ctx.get("argument_type")   or "N/A"
+    pattern_counter = opponent_ctx.get("pattern_counter") or "N/A"
+    judo_reframe    = opponent_ctx.get("judo_reframe")    or "N/A"
+    contradictions  = opponent_ctx.get("contradictions")  or "N/A"
+    predicted_next  = opponent_ctx.get("predicted_next")  or "N/A"
+    rolling_summary = opponent_ctx.get("rolling_summary") or "N/A"
 
-    # only show our last message in rebuttal/closing to avoid contradiction
+    # ── Our context ────────────────────────────────────
+    our_summary = opponent_ctx.get("our_summary") or "N/A"
+
     our_context = ""
     if our_last_message and phase != "opening":
-        our_context = f"\nYOUR LAST ARGUMENT (do not contradict this):\n{our_last_message}"
+        our_context = f"\nYOUR LAST ARGUMENT (do not contradict this):\n{our_last_message}\n"
 
+    # ── Phase instructions ─────────────────────────────
     phase_instructions = {
         "opening": (
             "- Introduce your stance clearly and confidently.\n"
-            "- Present 2 strong arguments with evidence.\n"
+            "- Present 2 strong arguments with evidence from VERIFIED FACTS.\n"
             "- Set the tone — you are the stronger side.\n"
-            "- End with a bold claim."
+            "- End with a bold, memorable claim."
         ),
-        "rebuttal": (
-            "- Directly address opponent's latest argument.\n"
-            "- Exploit the weaknesses identified above.\n"
-            "- Counter with evidence and logic.\n"
-            "- Reinforce your original stance.\n"
-            "- Do NOT repeat your previous points word for word."
-        ),
-        "defense": (
-            "- Acknowledge opponent's strongest point in one sentence — shows confidence.\n"
-            "- Then dismantle it: explain exactly why it fails under scrutiny.\n"
-            "- Reinforce your original argument with a NEW angle not yet used.\n"
-            "- Make clear your core position is unshaken.\n"
-            "- Do NOT repeat your previous points word for word."
+        "mid": (
+            "- Directly address opponent's LATEST ARGUMENT — use their exact words.\n"
+            "- Use the PATTERN COUNTER if applicable.\n"
+            "- Use the JUDO REFRAME if available — flip their point to our advantage.\n"
+            "- Name any logical fallacy explicitly.\n"
+            "- Exploit any CONTRADICTIONS found in their arguments.\n"
+            "- Reinforce your original stance with a NEW angle not yet used.\n"
+            "- Do NOT repeat claims listed in YOUR DEBATE HISTORY."
         ),
         "closing": (
             "- This is your FINAL argument — make it count.\n"
             "- Summarize your 2 strongest points briefly.\n"
-            "- Expose the biggest flaw in opponent's case.\n"
-            "- End with a powerful, memorable statement.\n"
+            "- Expose the biggest flaw in opponent's overall strategy.\n"
+            "- End with a powerful, memorable statement the judge will remember.\n"
             "- Do NOT introduce new arguments."
         )
     }
 
-    return f"""You are an elite AI debater competing in AgentSlam 2026.
-
-TOPIC: {topic}
+    return f"""TOPIC: {topic}
 YOUR STANCE: {stance}
 PHASE: {phase.upper()}
 
 VERIFIED FACTS YOU CAN USE:
 {facts_str}
 
-OPPONENT'S RECENT ARGUMENTS:
-{last_two_text}
+OPPONENT INTELLIGENCE:
+- Latest argument: {latest_message}
+- Argument type: {argument_type}
+- Counter strategy: {pattern_counter}
+- Judo reframe (flip their point): {judo_reframe}
+- Their contradictions to exploit: {contradictions}
+- They will likely argue next: {predicted_next}
+- Their overall strategy: {rolling_summary}
 
-OPPONENT'S WEAKNESSES:
-{weaknesses}
+YOUR DEBATE HISTORY:
+{our_summary}
 {our_context}
-
 PHASE INSTRUCTIONS:
-{phase_instructions[phase]}
-
-GLOBAL RULES:
-- Stay under 2000 characters.
-- Use 1-2 facts with sources — no fabricated statistics.
-- Sound confident and human, not robotic.
-- Output ONLY the argument text, nothing else.
-- Do not use markdown formatting, bold text, or headers. Write in natural flowing prose like a real debater speaking.
-"""
+{phase_instructions[phase]}"""
 
 
 # ── Claude Call ────────────────────────────────────────────────────────────────
 
 def call_claude(prompt: str) -> str:
-    """Call Claude Sonnet and return generated argument."""
+    """Call Claude Sonnet with system/user split and return argument."""
     try:
         response = client.messages.create(
             model=ANTHROPIC_MODEL,
             max_tokens=BRAIN_MAX_TOKENS,
+            system=SYSTEM_PROMPT,
             messages=[
                 {
                     "role": "user",
@@ -162,11 +162,11 @@ def call_claude(prompt: str) -> str:
                 }
             ]
         )
+        # print(prompt)
         return response.content[0].text.strip()
 
     except Exception as e:
         print(f"[brain] ⚠️ Claude error: {str(e)[:200]}")
-        # fallback — safe generic response that won't break the match
         return (
             "The evidence overwhelmingly supports our position. "
             "Our opponent has failed to address the core logical foundation "
@@ -186,25 +186,18 @@ def generate_argument(
 ) -> str:
     """
     Main entry point called by take_turn() in main.py.
-
-    Args:
-        topic:        debate topic from match-state
-        stance:       "PRO" or "CON"
-        opponent_ctx: from opponent.get_context_for_brain()
-        finish_time:  Unix timestamp in ms from server
-        our_history:  list of our past messages (full, for phase detection)
     """
 
     # ── Phase Detection ────────────────────────────────
     phase = get_phase(finish_time, our_history)
-    print(f"[brain] 🧠 Phase: {phase} | Time remaining: {(finish_time - time.time()*1000)/1000:.0f}s")
+    time_remaining = (finish_time - time.time() * 1000) / 1000
+    print(f"[brain] 🧠 Phase: {phase} | Time remaining: {time_remaining:.0f}s")
 
     # ── Facts ──────────────────────────────────────────
-    facts = get_facts_by_stance(topic, stance, MAX_FACTS_IN_PROMPT)
+    facts     = get_facts_by_stance(topic, stance, MAX_FACTS_IN_PROMPT)
     facts_str = format_facts_for_prompt(facts)
 
     # ── Our Last Message ───────────────────────────────
-    # only pass last message to avoid contradiction
     our_last_message = our_history[-1] if our_history else None
 
     # ── Build Prompt ───────────────────────────────────

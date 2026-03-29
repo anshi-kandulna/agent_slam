@@ -3,7 +3,7 @@
 # Also validates incoming server messages
 
 import json
-from config import PAYLOAD_BYTE_LIMIT
+from config import PAYLOAD_CHAR_LIMIT
 
 
 # ── Outgoing validation ────────────────────────────────────────────────────────
@@ -19,9 +19,8 @@ def validate_outgoing(message: str) -> tuple[bool, str]:
     if not message.strip():
         return False, "Message is empty"
 
-    byte_size = len(message.encode('utf-8'))
-    if byte_size > PAYLOAD_BYTE_LIMIT:
-        return False, f"Message too large: {byte_size} bytes (limit: {PAYLOAD_BYTE_LIMIT})"
+    if len(message) > PAYLOAD_CHAR_LIMIT:
+        return False, f"Message too large: {len(message)} chars (limit: {PAYLOAD_CHAR_LIMIT})"
 
     return True, ""
 
@@ -45,23 +44,6 @@ def build_payload(message: str) -> str | None:
         "type": "debate-message",
         "data": {
             "message": message
-        }
-    }
-    return json.dumps(payload, ensure_ascii=False)
-
-
-def build_sandbox_payload(message: str) -> str:
-    """
-    Sandbox uses different type field per spec:
-    {
-        "type": "sandbox-message",
-        "data": { "message": "..." }
-    }
-    """
-    payload = {
-        "type": "sandbox-message",
-        "data": {
-            "message": message[:500]
         }
     }
     return json.dumps(payload, ensure_ascii=False)
@@ -128,7 +110,6 @@ if __name__ == "__main__":
     print(build_payload("x" * 2600))
 
     print("\n=== Sandbox Tests ===")
-    print(build_sandbox_payload("Test argument for sandbox."))
 
     print("\n=== Incoming Tests ===")
     raw_turn = json.dumps({
