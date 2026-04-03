@@ -35,3 +35,4 @@ PAYLOAD_CHAR_LIMIT = 2500   # conservative under 2500 server limit
 MAX_FACTS_IN_PROMPT = 4     # ADD: keep prompts lean for speed
 MAX_HISTORY_TURNS   = 6     # ADD: cap history sent to Claude (token control)
 BRAIN_MAX_TOKENS    = 600   # ADD: keeps response under char limit safely
+MY_TEAM_SLOT = os.getenv("MY_TEAM_SLOT", "team1")

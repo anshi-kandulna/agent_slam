@@ -9,7 +9,7 @@ from config import (
     WS_MATCH_URL,
     WS_SANDBOX_URL,
     AUTH_TOKEN,
-    MY_TEAM_NAME,
+    MY_TEAM_SLOT, 
 )
 from validator import (
     parse_incoming,
@@ -97,8 +97,8 @@ def on_message(ws, message):
                 print(f"[main] 🕐 finish_time updated: {finish_time}")
 
             if not my_stance:
-                pros_team = data.get("pros", "")
-                my_stance = "PRO" if pros_team == MY_TEAM_NAME else "CON"
+                pros_slot = data.get("pros", "")
+                my_stance = "PRO" if pros_slot == MY_TEAM_SLOT else "CON"
                 print(f"[main] 🎭 Our stance: {my_stance}")
 
             status = data.get("status", "")
@@ -108,7 +108,7 @@ def on_message(ws, message):
 
             if match_live and not match_paused:
                 turn = data.get("turn", "")
-                if turn == MY_TEAM_NAME:
+                if turn == MY_TEAM_SLOT:
                     print("[main] 🎯 It's our turn!")
                     threading.Thread(
                         target=take_turn,
@@ -121,14 +121,14 @@ def on_message(ws, message):
             sender = parsed.get("from", "")
             msg    = extract_debate_message(parsed)
 
-            if msg and sender != MY_TEAM_NAME:
+            if msg and sender != MY_TEAM_SLOT:
                 print(f"[main] 📥 Opponent: {msg[:100]}...")
                 opponent.add_message(msg)
 
                 if topic and my_stance:
                     opponent.prefetch_opponent_analysis(topic, my_stance)
 
-            elif sender == MY_TEAM_NAME:
+            elif sender == MY_TEAM_SLOT:
                 print("[main] ✅ Our message broadcast confirmed")
 
         # ── PREVIOUS HISTORY ─────────────────────────────────
@@ -141,7 +141,7 @@ def on_message(ws, message):
                     team = conv.get("team", "")
                     if not msg:
                         continue
-                    if team != MY_TEAM_NAME:
+                    if team != MY_TEAM_SLOT:
                         opponent.add_message(msg)
                     else:
                         our_history.append(msg)
