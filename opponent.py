@@ -1,16 +1,10 @@
 # opponent.py
 # Tracks and analyzes opponent debate messages
-#
-# Architecture:
-#   - TWO separate prefetch triggers:
-#       1. prefetch_our_summary()       → called after WE send (opponent generation time)
-#       2. prefetch_opponent_analysis() → called after OPPONENT sends (server turn switch time)
-#   - ONE Groq call each → weakness + judo + arg type + rolling summary
-#   - Rolling incremental summary → fixed ~600 char input always
-#   - Best effort → never blocks our turn if cache not ready
-#   - Thread safe via lock
+# Change [2]: Added prefetch_analysis() + _cached_analysis so Groq runs
+#             in the background the moment the opponent sends a message,
+#             instead of blocking our turn generation.
 
-import threading
+import os
 from groq import Groq
 from config import GROQ_MODEL, GROQ_API_KEY
 
@@ -18,296 +12,115 @@ client = Groq(api_key=GROQ_API_KEY)
 
 
 class OpponentTracker:
+    """
+    Tracks opponent's last 2 messages and detects weaknesses via Groq.
+    Weakness analysis is now prefetched in a background thread as soon as
+    the opponent message arrives, so it's ready by the time our turn starts.
+    """
 
     def __init__(self):
-        self.history: list[str] = []       # full opponent message history
-        self._latest_message: str = ""     # most recent opponent message only
-
-        # ── Cached results ─────────────────────────────
-        self._opponent_analysis: dict = {} # weakness + judo + type + rolling summary
-        self._our_summary: str = ""        # rolling summary of our own arguments
-
-        # ── Thread safety ──────────────────────────────
-        self._lock = threading.Lock()
+        self.history: list[str] = []
+        self._cached_analysis: str | None = None   # [Change 2] prefetch cache
 
     def reset(self):
-        """Reset tracker for a new match."""
-        with self._lock:
-            self.history.clear()
-            self._latest_message    = ""
-            self._opponent_analysis = {}
-            self._our_summary       = ""
-        print("[opponent] 🔄 Tracker reset")
-
+        self.history.clear()
+        self._cached_analysis = None               # [Change 2] clear on reset
 
     # ── Message Tracking ───────────────────────────────────────────────────────
 
     def add_message(self, message: str):
-        """
-        Record opponent message.
-        Truncate to 400 chars — enough for analysis, prevents prompt bloat.
-        """
-        truncated = message[:400]
-        with self._lock:
-            self.history.append(truncated)
-            self._latest_message = truncated
-        print(f"[opponent] 📥 Recorded opponent message ({len(truncated)} chars)")
+        """Record opponent message. Keep only last 2."""
+        self.history.append(message)
+        if len(self.history) > 2:
+            self.history.pop(0)
+        # Invalidate cache — new message means old analysis is stale
+        self._cached_analysis = None              # [Change 2]
+        print(f"[opponent] 📥 Recorded opponent message ({len(message)} chars)")
 
+    def get_last_two_text(self) -> str:
+        if not self.history:
+            return "No opponent messages yet."
+        lines = []
+        for i, msg in enumerate(self.history):
+            turn_label = "Previous" if i == 0 and len(self.history) == 2 else "Latest"
+            lines.append(f"{turn_label}: {msg}")
+        return "\n\n".join(lines)
 
-    # ── Groq Call 1: Opponent Analysis ────────────────────────────────────────
+    # ── LLM Weakness Detection ─────────────────────────────────────────────────
 
-    def _run_opponent_analysis(self, topic: str, our_stance: str):
-        """
-        Single Groq call after opponent speaks.
-        Produces: arg type, pattern counter, judo reframe,
-                  core position, key claims, contradictions,
-                  predicted next, rolling opponent summary.
+    def detect_weaknesses(self, topic: str, our_stance: str) -> str:
+        if not self.history:
+            return "No opponent messages to analyze yet."
 
-        Input size fixed regardless of turn count:
-        - existing summary (~200 chars)
-        - latest message   (~400 chars)
-        Total: ~600 chars always
-        """
-        with self._lock:
-            latest   = self._latest_message
-            existing = self._opponent_analysis.get("rolling_summary", "")
+        prompt = f"""You are a debate coach analyzing an opponent's arguments.
 
-        if not latest:
-            return
-
-        # fixed size context — never grows
-        if existing:
-            context = (
-                f"Previous opponent summary:\n{existing}\n\n"
-                f"Opponent's latest argument:\n{latest}"
-            )
-        else:
-            context = f"Opponent's first argument:\n{latest}"
-
-        prompt = f"""You are a sharp debate analyst. Analyze this opponent argument.
-
-Topic: {topic}
+Debate Topic: {topic}
 Our Stance: {our_stance}
 
-{context}
+Opponent's recent arguments:
+{self.get_last_two_text()}
 
-Output EXACTLY this schema. No preamble. No explanations. Schema fields ONLY.
-Maximum 10 words per field. Write N/A if unsure.
+Identify weaknesses in 3 bullet points max:
+1. Logical fallacies or flawed reasoning
+2. Unsupported or unverifiable claims
+3. Contradictions or weak points to exploit
 
-ARGUMENT_TYPE: (emotional_appeal|statistical|authority|logical|anecdotal)
-PATTERN_COUNTER: (best 1-sentence counter strategy for this argument type)
-JUDO_REFRAME: (how to flip their point to support OUR side. N/A if not possible)
-CORE_POSITION: (their main stance in 1 sentence)
-KEY_CLAIMS: (max 3 bullets — strongest claims made so far)
-CONTRADICTIONS: (any inconsistencies between turns. N/A if none)
-PREDICTED_NEXT: (what they will likely argue next)
-ROLLING_SUMMARY: (updated 2-sentence summary of opponent's full strategy so far)"""
+Be sharp and concise. This feeds directly into our rebuttal."""
 
         try:
             response = client.chat.completions.create(
                 model=GROQ_MODEL,
                 messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a debate analyst. "
-                            "Output EXACTLY the schema requested. "
-                            "No preamble. No explanations. No extra text. "
-                            "Schema fields only. Maximum 10 words per field."
-                        )
-                    },
+                    {"role": "system", "content": "You are a sharp debate analyst. Be brief and precise."},
                     {"role": "user", "content": prompt}
                 ],
-                max_completion_tokens=200,
-                temperature=0.2
+                reasoning_effort="high",
+                max_completion_tokens=300,
+                temperature=0.3
             )
-
-            raw    = response.choices[0].message.content.strip()
-            print(f"[DEBUG] Groq raw response: '{raw[:300]}'")
-            parsed = self._parse_schema(raw)
-
-            with self._lock:
-                self._opponent_analysis = parsed
-            print(f"[opponent] ✅ Opponent analysis cached ({len(raw)} chars)")
+            analysis = response.choices[0].message.content.strip()
+            print(f"[opponent] 🔍 Weakness analysis complete ({len(analysis)} chars)")
+            return analysis
 
         except Exception as e:
-            print(f"[opponent] ⚠️ Opponent analysis failed: {str(e)[:150]}")
+            print(f"[opponent] ⚠️ Weakness detection failed: {str(e)[:200]}")
+            return "Could not analyze weaknesses. Proceed with general rebuttal."
 
+    # ── [Change 2] Prefetch Method ─────────────────────────────────────────────
+    # Called from main.py in a background daemon thread the moment an opponent
+    # message arrives. Stores result in _cached_analysis so get_context_for_brain
+    # can return it instantly when our turn fires.
 
-    # ── Groq Call 2: Our Summary ───────────────────────────────────────────────
-
-    def _run_our_summary(self, our_history: list[str]):
+    def prefetch_analysis(self, topic: str, our_stance: str):
         """
-        Single Groq call after WE send.
-        Runs during opponent's generation time — completely free time.
-        Feeds full our_history directly — no rolling summary to avoid contamination.
+        Run Groq weakness analysis in the background during the opponent's turn.
+        Result is cached so our turn starts with analysis already ready.
         """
-        if not our_history:
-            return
-
-        # label all our arguments clearly — no opponent text, no rolling summary
-        labeled_args = "\n\n".join(
-            f"OUR ARGUMENT {i+1}:\n{msg[:300]}"
-            for i, msg in enumerate(our_history)
-        )
-
-        prompt = f"""You are tracking what OUR debate agent has argued so far.
-
-    Below are ALL of OUR arguments in order. These are written by US, not the opponent.
-
-    {labeled_args}
-
-    Output EXACTLY this schema. No preamble. No explanations. Schema fields ONLY.
-    Maximum 10 words per field. Write N/A if unsure.
-
-    CLAIMS_MADE: (max 3 bullets — strongest points WE have made)
-    FACTS_CITED: (only stats or sources that appear in OUR text above. N/A if none)
-    NARRATIVE_ARC: (1 sentence — our overall argument thread)
-    AVOID: (specific phrases or claims already used — do not repeat these)"""
-
-        try:
-            response = client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a debate analyst tracking ONLY our own arguments. "
-                            "Output EXACTLY the schema requested. "
-                            "No preamble. No explanations. No extra text. "
-                            "Schema fields only. Maximum 10 words per field."
-                        )
-                    },
-                    {"role": "user", "content": prompt}
-                ],
-                max_completion_tokens=200,
-                temperature=0.2
-            )
-
-            raw = response.choices[0].message.content.strip()
-            print(f"[DEBUG] Groq raw response: '{raw[:300]}'")
-
-            with self._lock:
-                self._our_summary = raw
-            print(f"[opponent] ✅ Our summary cached ({len(raw)} chars)")
-
-        except Exception as e:
-            print(f"[opponent] ⚠️ Our summary failed: {str(e)[:150]}")
-
-    # ── Public Prefetch Methods ────────────────────────────────────────────────
-
-    def prefetch_our_summary(self, our_history: list[str]):
-        """
-        Called immediately after WE send our argument.
-        Runs during opponent's generation time — free time.
-        Never blocks.
-        """
-        threading.Thread(
-            target=self._run_our_summary,
-            args=(our_history,),
-            daemon=True
-        ).start()
-        print("[opponent] 🚀 Our summary thread launched (opponent generation time)")
-
-    def prefetch_opponent_analysis(self, topic: str, our_stance: str):
-        """
-        Called immediately after OPPONENT sends their argument.
-        Runs during server turn switch time — free time.
-        Never blocks.
-        """
-        threading.Thread(
-            target=self._run_opponent_analysis,
-            args=(topic, our_stance),
-            daemon=True
-        ).start()
-        print("[opponent] 🚀 Opponent analysis thread launched (server switch time)")
-
+        print("[opponent] 🔄 Prefetching weakness analysis in background...")
+        self._cached_analysis = self.detect_weaknesses(topic, our_stance)
+        print("[opponent] ✅ Prefetch complete — analysis cached")
 
     # ── Context for Brain ──────────────────────────────────────────────────────
+    # [Change 2] Returns cached analysis if available; only calls Groq live
+    # as a fallback if prefetch didn't run (e.g. very fast turn switch).
 
-    def get_context_for_brain(self) -> dict:
-        """
-        Returns all cached context for brain.py.
-        Best effort — returns whatever is ready, never blocks.
-        Falls back to N/A if threads not done yet.
-        """
-        with self._lock:
-            analysis    = self._opponent_analysis.copy()
-            our_summary = self._our_summary
-            latest_msg    = self._latest_message
+    def get_context_for_brain(self, topic: str, our_stance: str, run_llm: bool = True) -> dict:
+        weaknesses = None
+
+        if self.history:
+            if self._cached_analysis:
+                # Prefetch already ran — use the cached result instantly
+                print("[opponent] ⚡ Using prefetched analysis")
+                weaknesses = self._cached_analysis
+            elif run_llm:
+                # Fallback: prefetch didn't complete in time, run synchronously
+                print("[opponent] ⏳ Prefetch not ready — running Groq synchronously")
+                weaknesses = self.detect_weaknesses(topic, our_stance)
 
         return {
-            # opponent intelligence
-            "latest_message":  latest_msg or "No opponent messages yet.",
-            "argument_type":   analysis.get("argument_type",   "N/A"),
-            "pattern_counter": analysis.get("pattern_counter", "N/A"),
-            "judo_reframe":    analysis.get("judo_reframe",    "N/A"),
-            "core_position":   analysis.get("core_position",   "N/A"),
-            "key_claims":      analysis.get("key_claims",      "N/A"),
-            "contradictions":  analysis.get("contradictions",  "N/A"),
-            "predicted_next":  analysis.get("predicted_next",  "N/A"),
-            "rolling_summary": analysis.get("rolling_summary", "N/A"),
-
-            # our own intelligence
-            "our_summary":     our_summary or "N/A",
+            "last_two_text": self.get_last_two_text(),
+            "weaknesses": weaknesses or "No analysis available."
         }
-
-
-    # ── Schema Parser ──────────────────────────────────────────────────────────
-
-    def _parse_schema(self, raw: str) -> dict:
-        """
-        Extracts schema fields from Groq output.
-        Robust to minor Groq formatting deviations.
-        """
-        fields = [
-            "argument_type",
-            "pattern_counter",
-            "judo_reframe",
-            "core_position",
-            "key_claims",
-            "contradictions",
-            "predicted_next",
-            "rolling_summary",
-        ]
-
-        key_map = {
-            "ARGUMENT_TYPE":   "argument_type",
-            "PATTERN_COUNTER": "pattern_counter",
-            "JUDO_REFRAME":    "judo_reframe",
-            "CORE_POSITION":   "core_position",
-            "KEY_CLAIMS":      "key_claims",
-            "CONTRADICTIONS":  "contradictions",
-            "PREDICTED_NEXT":  "predicted_next",
-            "ROLLING_SUMMARY": "rolling_summary",
-        }
-
-        result        = {f: "N/A" for f in fields}
-        current_key   = None
-        current_lines = []
-
-        for line in raw.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-
-            matched = False
-            for schema_key, field_name in key_map.items():
-                if line.upper().startswith(schema_key + ":"):
-                    if current_key:
-                        result[current_key] = "\n".join(current_lines).strip() or "N/A"
-                    current_key   = field_name
-                    current_lines = [line[len(schema_key) + 1:].strip()]
-                    matched       = True
-                    break
-
-            if not matched and current_key:
-                current_lines.append(line)
-
-        if current_key:
-            result[current_key] = "\n".join(current_lines).strip() or "N/A"
-
-        return result
 
 
 # ── Singleton instance ─────────────────────────────────────────────────────────
